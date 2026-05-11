@@ -1,0 +1,21 @@
+[project]
+name = "fuel-mate"
+version = "0.1.0"
+description = "Telegram bot helping UK drivers find the cheapest fuel nearby"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+# Where to look for tests
+testpaths = ["tests"]
+# Recognise tests named test_*.py or *_test.py
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# Make pytest-asyncio default to auto mode so async test functions
+# don't need @pytest.mark.asyncio decorator on every one.
+asyncio_mode = "auto"
+# Pin fixture loop scope to silence pytest-asyncio deprecation warning.
+# 'function' is the default that future pytest-asyncio versions will use.
+asyncio_default_fixture_loop_scope = "function"
+# Verbose output by default
+addopts = "-v --tb=short"

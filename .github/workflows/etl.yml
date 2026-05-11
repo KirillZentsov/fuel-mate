@@ -1,0 +1,37 @@
+name: ETL pipeline
+
+on:
+  schedule:
+    - cron: '15 9 * * *'    # 09:15 UTC = 10:15 BST / 09:15 GMT
+    - cron: '15 10 * * *'   # 10:15 UTC = 11:15 BST / 10:15 GMT
+    - cron: '15 15 * * *'   # 15:15 UTC = 16:15 BST / 15:15 GMT
+    - cron: '15 16 * * *'   # 16:15 UTC = 17:15 BST / 16:15 GMT
+  
+  workflow_dispatch: {}
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install ETL dependencies
+        run: pip install -r requirements-etl.txt
+
+      - name: Run ETL pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          FUEL_PRICES_CSV_URL: ${{ vars.FUEL_PRICES_CSV_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: python -m etl.pipeline

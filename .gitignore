@@ -1,0 +1,74 @@
+# Byte-compiled / cached Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment variables (NEVER commit real .env)
+.env
+.env.local
+.env.*.local
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+
+# Type checkers
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project-specific: large data files we don't commit
+# postcodes.csv.gz IS committed (needed by bot at runtime), so do NOT ignore it.
+# Temp ETL artefacts:
+/tmp_csv/
+*.csv.tmp
+
+# Logs
+*.log
+
+# Alembic — keep migration scripts, ignore nothing here
+
+# Test/dev CSV files at the project root — should never be committed
+/latest.csv
+/result50.csv
+/*.csv
+
+# Postcodes data — too large to ship in the repo (~80 MB).
+# In production it lives on the deployment server (mounted/downloaded separately)
+# or as data/postcodes.csv.gz which is the compressed format we DO commit.
+/data/postcodes.csv
+/data/*.csv
+
+# Windows / macOS metadata files
+desktop.ini
+Thumbs.db
+.DS_Store
