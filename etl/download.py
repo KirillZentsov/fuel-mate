@@ -127,10 +127,14 @@ async def _download_once() -> DownloadResult:
     sha = hashlib.sha256()
     byte_size = 0
 
-    async with httpx.AsyncClient(timeout=config.DOWNLOAD_TIMEOUT_SECONDS) as client:
+    # gov.uk blocks default httpx/requests User-Agents with 403 Forbidden.
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.90 Safari/537.36",
+    }
+    async with httpx.AsyncClient(timeout=config.DOWNLOAD_TIMEOUT_SECONDS, headers=headers) as client:
         async with client.stream("GET", config.FUEL_PRICES_CSV_URL) as response:
-            response.raise_for_status()  # raises on 4xx/5xx
-
+            response.raise_for_status() # raises on 4xx/5xx
+ 
             with tmp_path.open("wb") as f:
                 async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
                     sha.update(chunk)
