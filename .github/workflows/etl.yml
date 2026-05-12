@@ -1,12 +1,14 @@
 name: ETL pipeline
 
+
 on:
-  schedule:
-    - cron: '15 9 * * *'    # 09:15 UTC = 10:15 BST / 09:15 GMT
-    - cron: '15 10 * * *'   # 10:15 UTC = 11:15 BST / 10:15 GMT
-    - cron: '15 15 * * *'   # 15:15 UTC = 16:15 BST / 15:15 GMT
-    - cron: '15 16 * * *'   # 16:15 UTC = 17:15 BST / 16:15 GMT
-  
+  # Cron disabled while we migrate from CSV download (now WAF-blocked)
+  # to the official OAuth API at developer.fuel-finder.service.gov.uk.
+  # schedule:
+  #   - cron: '15 9 * * *'
+  #   - cron: '15 10 * * *'
+  #   - cron: '15 15 * * *'
+  #   - cron: '15 16 * * *'
   workflow_dispatch: {}
 
 jobs:
