@@ -1,0 +1,31 @@
+name: Diag - test gov.uk download
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe with Kirill's working headers
+        run: |
+          curl -v -o /tmp/test.csv \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" \
+            -H "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7" \
+            -H "Accept-Encoding: gzip, deflate, br" \
+            "https://www.fuel-finder.service.gov.uk/internal/v1.0.2/csv/get-latest-fuel-prices-csv" \
+            2>&1 | head -100
+          
+          echo ""
+          echo "=== File info ==="
+          ls -la /tmp/test.csv
+          echo ""
+          echo "=== First 500 bytes ==="
+          head -c 500 /tmp/test.csv
+
+      - name: Show runner IP
+        run: |
+          echo "Runner public IP:"
+          curl -s https://api.ipify.org
+          echo ""
+          echo "Hostname: $(hostname)"
