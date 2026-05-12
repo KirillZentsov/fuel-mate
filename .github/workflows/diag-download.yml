@@ -1,0 +1,53 @@
+name: Diag - test gov.uk download
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test 1 - curl (worked last time)
+        continue-on-error: true
+        run: |
+          echo "=== curl ==="
+          curl -s -o /dev/null -w "Status: %{http_code}\nSize: %{size_download}\n" \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" \
+            -H "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7" \
+            -H "Accept-Encoding: gzip, deflate, br" \
+            "https://www.fuel-finder.service.gov.uk/internal/v1.0.2/csv/get-latest-fuel-prices-csv"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test 2 - httpx (our code uses this)
+        continue-on-error: true
+        run: |
+          pip install httpx
+          python -c "
+          import httpx
+          h = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+              'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+              'Accept-Encoding': 'gzip, deflate, br',
+          }
+          r = httpx.get('https://www.fuel-finder.service.gov.uk/internal/v1.0.2/csv/get-latest-fuel-prices-csv', headers=h, timeout=15)
+          print(f'httpx status: {r.status_code}, size: {len(r.content)}')
+          "
+
+      - name: Test 3 - requests (used this locally)
+        continue-on-error: true
+        run: |
+          pip install requests
+          python -c "
+          import requests
+          h = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+              'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+              'Accept-Encoding': 'gzip, deflate, br',
+          }
+          r = requests.get('https://www.fuel-finder.service.gov.uk/internal/v1.0.2/csv/get-latest-fuel-prices-csv', headers=h, timeout=15)
+          print(f'requests status: {r.status_code}, size: {len(r.content)}')
+          "
