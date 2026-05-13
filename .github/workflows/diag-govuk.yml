@@ -1,0 +1,66 @@
+name: Diag - probe gov.uk from GitHub Actions
+
+# This workflow does NOT run the ETL. It only tests whether the gov.uk
+# Fuel Finder API is reachable at all from GitHub-hosted runners.
+#
+# Three probes, smallest-to-largest:
+#   1. Plain GET /api/v1/health (or root) — just to confirm DNS+TCP work
+#   2. POST to token endpoint with INVALID credentials — should get a 401
+#      (Invalid client credentials). If we get 403 here, the WAF is
+#      rejecting us BEFORE the auth layer.
+#   3. POST to token endpoint with REAL credentials — should get a 200.
+#      If 403, the WAF blocks even real auth attempts.
+#
+# Goal: distinguish "blocked by WAF" (403 on probe 2) vs "auth failure"
+# (401 on probe 2) vs "all good" (401 on probe 2 + 200 on probe 3).
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Show runner IP
+        run: |
+          echo "Runner public IP: $(curl -s https://api.ipify.org)"
+          echo "Runner hostname:  $(hostname)"
+
+      - name: Probe 1 — DNS + TCP reachability
+        run: |
+          echo "Resolving DNS:"
+          getent hosts www.fuel-finder.service.gov.uk || true
+          echo ""
+          echo "TCP reachability (curl -v, head only):"
+          curl -sv --max-time 10 https://www.fuel-finder.service.gov.uk/ \
+            -o /dev/null 2>&1 | head -30 || true
+
+      - name: Probe 2 — POST with INVALID credentials
+        run: |
+          echo "Expected: 401 Unauthorized (= auth layer received the request)"
+          echo "If 403:   WAF is blocking before auth (this is our hypothesis)"
+          echo ""
+          curl -s -w "\nHTTP_STATUS: %{http_code}\n" \
+            -X POST https://www.fuel-finder.service.gov.uk/api/v1/oauth/generate_access_token \
+            -H "Content-Type: application/json" \
+            -d '{"client_id": "fake_id_for_test", "client_secret": "fake_secret"}' \
+            --max-time 30
+
+      - name: Probe 3 — POST with REAL credentials
+        env:
+          FUEL_FINDER_CLIENT_ID: ${{ secrets.FUEL_FINDER_CLIENT_ID }}
+          FUEL_FINDER_CLIENT_SECRET: ${{ secrets.FUEL_FINDER_CLIENT_SECRET }}
+        run: |
+          echo "Expected: 200 OK with a JSON body containing access_token"
+          echo "Body will be redacted in logs — only status code shown."
+          echo ""
+          # We pipe the body to /dev/null so the access_token doesn't leak
+          # to logs. Only the status code is printed via -w.
+          curl -s -w "HTTP_STATUS: %{http_code}\n" \
+            -X POST https://www.fuel-finder.service.gov.uk/api/v1/oauth/generate_access_token \
+            -H "Content-Type: application/json" \
+            -d "{\"client_id\": \"$FUEL_FINDER_CLIENT_ID\", \"client_secret\": \"$FUEL_FINDER_CLIENT_SECRET\"}" \
+            --max-time 30 \
+            -o /dev/null
