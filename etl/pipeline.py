@@ -163,7 +163,7 @@ async def _notify_success(load_result, refresh_result, total_seconds: float) -> 
 async def _notify_duplicate(sha256: str) -> None:
     """Spec section 6.9 — duplicate sha256 deserves an INFO note, not OK."""
     text = (
-        f"ETL skipped — duplicate CSV\n"
+        f"ETL skipped — no new data\n"
         f"Same sha256 (<code>{sha256[:12]}…</code>) as last run."
     )
     await admin_notifier.notify_info(text)
