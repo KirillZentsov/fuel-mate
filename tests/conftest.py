@@ -25,3 +25,15 @@ def sample_csv_path() -> Path:
     run offline in CI without external dependencies.
     """
     return Path(__file__).parent / "fixtures" / "sample_fuel_data.csv"
+
+
+@pytest.fixture
+def sample_parsed_stations(sample_csv_path):
+    """
+    Parse the sample CSV into a list[ParsedStation].
+
+    Used by tests that exercise the post-parse layer (load_staging,
+    refresh_mart). Saves them from re-parsing inside every test.
+    """
+    from shared.csv_parser import parse_fuel_csv
+    return list(parse_fuel_csv(sample_csv_path))

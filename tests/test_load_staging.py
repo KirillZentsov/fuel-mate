@@ -12,44 +12,44 @@ This keeps the test suite fast and runnable in CI without service mocks.
 import json
 from datetime import datetime, timezone
 
-from etl.load_staging import _parse_to_records, _ts_range
+from etl.load_staging import _records_from_parsed as _parse_to_records, _ts_range
 
 
 class TestParseToRecords:
-    def test_returns_two_lists(self, sample_csv_path):
-        stations, prices = _parse_to_records(sample_csv_path, dump_id=42)
+    def test_returns_two_lists(self, sample_parsed_stations):
+        stations, prices = _parse_to_records(sample_parsed_stations, dump_id=42)
         assert isinstance(stations, list)
         assert isinstance(prices, list)
 
-    def test_station_count_matches_csv(self, sample_csv_path):
-        stations, _ = _parse_to_records(sample_csv_path, dump_id=42)
+    def test_station_count_matches_csv(self, sample_parsed_stations):
+        stations, _ = _parse_to_records(sample_parsed_stations, dump_id=42)
         assert len(stations) == 12  # fixture has 12 rows
 
-    def test_price_count_matches_csv(self, sample_csv_path):
+    def test_price_count_matches_csv(self, sample_parsed_stations):
         # 12 stations, between 0 and 4 fuels each — exact count is data-dependent.
         # Just verify it's reasonable.
-        _, prices = _parse_to_records(sample_csv_path, dump_id=42)
+        _, prices = _parse_to_records(sample_parsed_stations, dump_id=42)
         assert 30 <= len(prices) <= 48
 
-    def test_dump_id_in_first_position(self, sample_csv_path):
-        stations, prices = _parse_to_records(sample_csv_path, dump_id=42)
+    def test_dump_id_in_first_position(self, sample_parsed_stations):
+        stations, prices = _parse_to_records(sample_parsed_stations, dump_id=42)
         for s in stations:
             assert s[0] == 42
         for p in prices:
             assert p[0] == 42
 
-    def test_dump_id_none_passthrough(self, sample_csv_path):
+    def test_dump_id_none_passthrough(self, sample_parsed_stations):
         # dump_id=None is the placeholder mode used before the DB INSERT.
-        stations, prices = _parse_to_records(sample_csv_path, dump_id=None)
+        stations, prices = _parse_to_records(sample_parsed_stations, dump_id=None)
         for s in stations:
             assert s[0] is None
         for p in prices:
             assert p[0] is None
 
-    def test_jsonb_columns_serialized_as_strings(self, sample_csv_path):
+    def test_jsonb_columns_serialized_as_strings(self, sample_parsed_stations):
         # asyncpg COPY needs strings for JSONB; make sure we serialize.
         # Position 13 = opening_hours, 14 = amenities (in our tuple layout).
-        stations, _ = _parse_to_records(sample_csv_path, dump_id=42)
+        stations, _ = _parse_to_records(sample_parsed_stations, dump_id=42)
         for s in stations:
             opening_hours_str = s[13]
             amenities_str = s[14]
@@ -59,15 +59,15 @@ class TestParseToRecords:
             json.loads(opening_hours_str)
             json.loads(amenities_str)
 
-    def test_station_record_length_matches_columns(self, sample_csv_path):
+    def test_station_record_length_matches_columns(self, sample_parsed_stations):
         # Sanity check: 16 fields per station record (matching _STATION_COLS)
         from etl.load_staging import _STATION_COLS
-        stations, _ = _parse_to_records(sample_csv_path, dump_id=42)
+        stations, _ = _parse_to_records(sample_parsed_stations, dump_id=42)
         assert len(stations[0]) == len(_STATION_COLS)
 
-    def test_price_record_length_matches_columns(self, sample_csv_path):
+    def test_price_record_length_matches_columns(self, sample_parsed_stations):
         from etl.load_staging import _PRICE_COLS
-        _, prices = _parse_to_records(sample_csv_path, dump_id=42)
+        _, prices = _parse_to_records(sample_parsed_stations, dump_id=42)
         assert len(prices[0]) == len(_PRICE_COLS)
 
 

@@ -10,16 +10,16 @@ For local development:
 
     python -m etl.pipeline --local-csv path/to/file.csv
 
-Stage flow (per spec section 6.2):
-  1. download   — fetch CSV from gov.uk (or read local file)
-  2. dedup      — check sha256 in raw.fuel_data_dumps; short-circuit if known
-  3. archive    — upload CSV to GitHub Release (best-effort, optional)
-  4. load       — INSERT raw row + COPY into staging.{stations,prices}
-  5. refresh    — UPSERT mart.{stations,prices_current} + INSERT prices_history
-  6. notify     — admin channel: ✅ OK / ℹ️ skipped / 🚨 failed
+Stage flow:
+  1. fetch     — pull data from gov.uk API (or read local CSV file)
+  2. dedup     — check sha256 in raw.fuel_data_dumps; short-circuit if known
+  3. archive   — upload to GitHub Release (only for local-CSV runs, best-effort)
+  4. load      — INSERT raw row + COPY into staging.{stations,prices}
+  5. refresh   — UPSERT mart.{stations,prices_current} + INSERT prices_history
+  6. notify    — admin channel: ✅ OK / ℹ️ skipped / 🚨 failed
 
 Stages 6 (alerts) and 7 (daily summary) live in separate modules — see
-spec section 6.8 and 6.10. They run after the bot is in place.
+spec section 6.8 and 6.10.
 """
 import argparse
 import asyncio
@@ -30,9 +30,9 @@ import time
 from pathlib import Path
 
 from etl import config
-from etl.download import download_csv, DownloadError
+from etl.download import fetch_data, DownloadError
 from etl.upload_release import upload_to_release, UploadError
-from etl.load_staging import load_csv_into_staging
+from etl.load_staging import load_stations_into_staging
 from etl.refresh_mart import refresh_mart
 from shared import admin_notifier
 
@@ -67,44 +67,44 @@ async def run_pipeline(local_csv: Path | None = None) -> int:
              config.DRY_RUN, local_csv)
 
     try:
-        # Stage 1 — download
-        with _timed("download"):
-            dl = await download_csv(local_csv_path=local_csv)
-        log.info("Downloaded %d bytes, sha256=%s…", dl.byte_size, dl.sha256[:12])
+        # Stage 1 — fetch (API or local CSV)
+        with _timed("fetch"):
+            dl = await fetch_data(local_csv_path=local_csv)
+        log.info(
+            "Fetched %d stations from %s. sha256=%s…",
+            len(dl.stations), dl.source, dl.sha256[:12],
+        )
 
-        # Stage 2 — dedup short-circuit lives inside load_csv_into_staging.
-        # We can't avoid the upload before knowing duplicate status, so the
-        # archive step happens AFTER load (slight reordering vs spec section
-        # 6.2 — described in the comment block at top of this file).
+        # Stage 2 — dedup short-circuit lives inside load_stations_into_staging.
 
         # Stage 3 — load (also handles dedup)
         with _timed("load_staging"):
-            load_result = await load_csv_into_staging(
-                csv_path=dl.path,
+            load_result = await load_stations_into_staging(
+                stations=dl.stations,
                 sha256=dl.sha256,
-                file_name=Path(dl.path).name,
+                file_name=dl.source,
             )
 
         if load_result.is_duplicate:
             await _notify_duplicate(dl.sha256)
             return 0
 
-        # Stage 4 — archive to GitHub Release (best-effort).
-        # Failure here is non-fatal: the data is already in the database.
-        # We log a warning, send a non-critical admin note, and continue.
+        # Stage 4 — archive (best-effort).
+        # API runs don't archive — there's no raw file to upload. Kept for
+        # local-CSV runs where we want to push the historical CSV to releases.
         release_url: str | None = None
-        with _timed("upload_release"):
-            try:
-                release_url = await upload_to_release(dl.path, dl.sha256)
-            except UploadError as exc:
-                log.warning("Archive upload failed (non-fatal): %s", exc)
-                await admin_notifier.notify_warning(
-                    f"GitHub release upload failed: {exc}\n"
-                    f"Data already in DB. Continuing."
-                )
+        if local_csv is not None:
+            with _timed("upload_release"):
+                try:
+                    release_url = await upload_to_release(local_csv, dl.sha256)
+                except UploadError as exc:
+                    log.warning("Archive upload failed (non-fatal): %s", exc)
+                    await admin_notifier.notify_warning(
+                        f"GitHub release upload failed: {exc}\n"
+                        f"Data already in DB. Continuing."
+                    )
 
         if release_url:
-            # Update the raw row with the URL, now that we have it.
             await _update_release_url(load_result.dump_id, release_url)
 
         # Stage 5 — refresh mart
@@ -115,7 +115,6 @@ async def run_pipeline(local_csv: Path | None = None) -> int:
         total_seconds = time.monotonic() - overall_start
         await _notify_success(load_result, refresh_result, total_seconds)
 
-        # Slow-run warning
         if total_seconds > config.ETL_SLOW_THRESHOLD_SECONDS:
             await _notify_slow(total_seconds)
 

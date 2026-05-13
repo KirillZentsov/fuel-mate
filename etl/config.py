@@ -44,7 +44,24 @@ DATABASE_URL: str = _required("DATABASE_URL")
 TELEGRAM_BOT_TOKEN: str | None = _optional("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID: str | None = _optional("ADMIN_CHAT_ID")
 
-# ─── gov.uk source ────────────────────────────────────────────────────
+# ─── gov.uk Fuel Finder API ───────────────────────────────────────────
+# OAuth 2.0 client credentials. Get them from:
+#   https://www.developer.fuel-finder.service.gov.uk/
+# These are REQUIRED for production runs. Locally they can be missing if
+# you only ever invoke the pipeline with --local-csv.
+
+FUEL_FINDER_CLIENT_ID: str | None = _optional("FUEL_FINDER_CLIENT_ID")
+FUEL_FINDER_CLIENT_SECRET: str | None = _optional("FUEL_FINDER_CLIENT_SECRET")
+FUEL_FINDER_BASE_URL: str = _optional(
+    "FUEL_FINDER_BASE_URL",
+    "https://www.fuel-finder.service.gov.uk",
+) or "https://www.fuel-finder.service.gov.uk"
+
+# ─── Legacy CSV URL ───────────────────────────────────────────────────
+# The old anonymous CSV endpoint, kept only for reference. As of early
+# 2026 it returns 403 to non-residential IPs (gov.uk WAF). We do NOT
+# fetch this URL in production — we use the API instead. Kept here so
+# documentation/comments that reference it still resolve to a string.
 
 FUEL_PRICES_CSV_URL: str = _optional(
     "FUEL_PRICES_CSV_URL",

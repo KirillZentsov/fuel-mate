@@ -8,14 +8,24 @@ Both stages share the same database connection so we can use a transaction
 for the staging inserts: if the bulk copy fails midway, the dump_id row
 is also rolled back.
 
-Returns the dump_id (BIGINT) so downstream stages can reference it. If the
-sha256 was already loaded, returns None and skips the staging write — the
-orchestrator treats that as 'no-op duplicate' and short-circuits.
+Public API:
+  - `load_stations_into_staging(stations, sha256, file_name, release_url)`
+    — primary entry point. Accepts a list of ParsedStation from any
+    source (JSON API, CSV file, or unit test fixtures).
+  - `load_csv_into_staging(csv_path, sha256, file_name, release_url)`
+    — convenience wrapper: parses a CSV file and calls the primary API.
+    Used by `--local-csv` runs of the pipeline.
+
+If the sha256 was already loaded, the function returns with
+`is_duplicate=True` and skips the staging write — the orchestrator treats
+that as a no-op duplicate and short-circuits.
 """
+import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 import asyncpg
 
@@ -48,79 +58,80 @@ _PRICE_COLS = (
 )
 
 
-async def load_csv_into_staging(
-    csv_path: Path,
+# ──────────────────────────────────────────────────────────────────────
+# Primary entry point — accepts pre-parsed records
+# ──────────────────────────────────────────────────────────────────────
+
+async def load_stations_into_staging(
+    stations: list[ParsedStation],
     sha256: str,
-    file_name: str | None = None,
+    file_name: str = "api-fetch",
     release_url: str | None = None,
 ) -> LoadResult:
     """
-    Stream the CSV into staging tables.
+    Bulk-load parsed stations + their prices into staging.
+
+    This is the source-agnostic entry point. The caller has already parsed
+    raw data from somewhere (gov.uk API, local CSV, fixture) into the
+    ParsedStation dataclass.
 
     Workflow:
-      1. Open connection.
-      2. Check raw.fuel_data_dumps for this sha256 — short-circuit if found.
-      3. Open transaction.
-      4. Parse CSV (lazy iterator from shared.csv_parser).
-      5. Build station + price record tuples in two lists.
-      6. INSERT raw.fuel_data_dumps row → get dump_id.
-      7. COPY both lists into staging.{stations,prices}.
-      8. Commit.
+      1. Check raw.fuel_data_dumps for sha256 — short-circuit on duplicate.
+      2. Open a transaction.
+      3. INSERT raw.fuel_data_dumps row → get dump_id.
+      4. COPY two lists into staging.{stations,prices}.
+      5. Commit.
 
     Args:
-        csv_path: path to the CSV (already validated by download stage).
-        sha256: digest of the file. Used for dedup.
-        file_name: human-friendly name to record (default: csv_path.name).
+        stations: list of ParsedStation, each with `.prices`.
+        sha256: digest used for dedup. For API runs, computed over the
+            canonical JSON. For CSV runs, the file digest.
+        file_name: friendly identifier for raw.fuel_data_dumps.file_name.
         release_url: optional GitHub Release URL for audit.
 
     Returns:
-        LoadResult — see dataclass above.
+        LoadResult.
 
     Raises:
-        asyncpg.PostgresError on any DB failure (caller logs + retries pipeline).
+        asyncpg.PostgresError on any DB failure.
     """
-    file_name = file_name or csv_path.name
-
     if config.DRY_RUN:
-        log.info("DRY_RUN — parsing CSV but not writing to DB.")
-        # In dry-run we still parse to validate, but skip DB entirely
-        stations, prices = _parse_to_records(csv_path, dump_id=0)
+        log.info("DRY_RUN — would load %d stations.", len(stations))
+        station_records, price_records = _records_from_parsed(stations, dump_id=0)
         return LoadResult(
             dump_id=None, is_duplicate=False,
-            station_count=len(stations), price_count=len(prices),
+            station_count=len(station_records),
+            price_count=len(price_records),
+        )
+
+    if not stations:
+        raise ValueError(
+            "Got 0 stations to load. Treating as malformed source — aborting."
         )
 
     conn: asyncpg.Connection = await asyncpg.connect(config.DATABASE_URL)
     try:
-        # Stage 3a — duplicate check
         existing = await conn.fetchval(
             "SELECT id FROM raw.fuel_data_dumps WHERE sha256 = $1",
             sha256,
         )
         if existing is not None:
-            log.info("CSV with sha256 %s… already loaded as dump_id=%d. Skipping.",
-                     sha256[:12], existing)
+            log.info(
+                "Source with sha256 %s… already loaded as dump_id=%d. Skipping.",
+                sha256[:12], existing,
+            )
             return LoadResult(
                 dump_id=existing, is_duplicate=True,
                 station_count=0, price_count=0,
             )
 
-        # Parse CSV into in-memory record lists. Tested: 50 rows produces
-        # 50 stations + 157 prices. At 8000 stations expect ~5-6 MB RAM.
-        # Important: we parse BEFORE opening the transaction so a parser
-        # error doesn't leave a half-applied dump_id row.
-        # We don't have dump_id yet — pass placeholder, fix after INSERT.
-        stations, prices = _parse_to_records(csv_path, dump_id=None)
-        if not stations:
-            raise ValueError(
-                "CSV produced 0 stations. Treating as malformed source — aborting."
-            )
+        # Build COPY-ready records with placeholder dump_id; we'll fix it
+        # after the INSERT below.
+        station_records, price_records = _records_from_parsed(stations, dump_id=None)
 
-        # Compute aggregates needed for raw.fuel_data_dumps row
-        forecourt_min, forecourt_max = _ts_range(stations)
+        forecourt_min, forecourt_max = _ts_range(station_records)
 
         async with conn.transaction():
-            # Stage 3b — register dump
             dump_id: int = await conn.fetchval(
                 """
                 INSERT INTO raw.fuel_data_dumps
@@ -129,62 +140,85 @@ async def load_csv_into_staging(
                 VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING id
                 """,
-                file_name, release_url, sha256, len(stations),
+                file_name, release_url, sha256, len(station_records),
                 forecourt_min, forecourt_max,
             )
 
-            # Inject the real dump_id into the records (it was placeholder)
-            stations = [(dump_id, *r[1:]) for r in stations]
-            prices = [(dump_id, *r[1:]) for r in prices]
+            # Fill the placeholder dump_id with the real one
+            station_records = [(dump_id, *r[1:]) for r in station_records]
+            price_records = [(dump_id, *r[1:]) for r in price_records]
 
-            # Stage 4 — bulk insert via COPY
             await conn.copy_records_to_table(
                 "stations",
                 schema_name="staging",
                 columns=_STATION_COLS,
-                records=stations,
+                records=station_records,
             )
             await conn.copy_records_to_table(
                 "prices",
                 schema_name="staging",
                 columns=_PRICE_COLS,
-                records=prices,
+                records=price_records,
             )
 
         log.info(
             "Loaded dump_id=%d: %d stations, %d prices.",
-            dump_id, len(stations), len(prices),
+            dump_id, len(station_records), len(price_records),
         )
         return LoadResult(
             dump_id=dump_id, is_duplicate=False,
-            station_count=len(stations), price_count=len(prices),
+            station_count=len(station_records),
+            price_count=len(price_records),
         )
     finally:
         await conn.close()
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Convenience wrapper for CSV path (legacy / --local-csv)
+# ──────────────────────────────────────────────────────────────────────
+
+async def load_csv_into_staging(
+    csv_path: Path,
+    sha256: str,
+    file_name: str | None = None,
+    release_url: str | None = None,
+) -> LoadResult:
+    """
+    Parse a CSV file and forward to the primary loader.
+
+    Kept for backward compatibility with `--local-csv` invocations.
+    """
+    file_name = file_name or csv_path.name
+    stations = list(parse_fuel_csv(csv_path))
+    return await load_stations_into_staging(
+        stations=stations,
+        sha256=sha256,
+        file_name=file_name,
+        release_url=release_url,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Helpers — convert ParsedStation/ParsedPrice into asyncpg-ready tuples
 # ──────────────────────────────────────────────────────────────────────
 
-def _parse_to_records(
-    csv_path: Path,
+def _records_from_parsed(
+    stations: Iterable[ParsedStation],
     dump_id: int | None,
 ) -> tuple[list[tuple], list[tuple]]:
     """
-    Walk the CSV via parse_fuel_csv() and build COPY-ready record tuples.
+    Build COPY-ready tuples from ParsedStation objects.
 
     For JSONB columns (opening_hours, amenities), asyncpg expects a JSON
     string, not a Python dict. We serialize here.
 
-    The dump_id can be None — caller will overwrite once it's known.
+    The dump_id can be None — the caller overwrites it after INSERT.
     """
-    import json
-
     station_records: list[tuple] = []
     price_records: list[tuple] = []
 
-    for s in parse_fuel_csv(csv_path):
+    for s in stations:
         station_records.append((
             dump_id,
             s.station_id,
@@ -219,7 +253,7 @@ def _ts_range(
     station_records: list[tuple],
 ) -> tuple[datetime | None, datetime | None]:
     """Compute min/max forecourt_updated_at across all parsed stations."""
-    # Position 15 in our tuple layout = forecourt_updated_at (0-indexed)
+    # Position 15 in the tuple layout = forecourt_updated_at (0-indexed)
     timestamps = [r[15] for r in station_records if r[15] is not None]
     if not timestamps:
         return (None, None)

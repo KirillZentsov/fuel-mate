@@ -1,190 +1,192 @@
 """
-Stage 1 of the ETL pipeline: download the latest fuel-prices CSV.
+Stage 1 of the ETL pipeline: fetch the latest fuel-prices data.
 
-Workflow:
-  1. GET the CSV from gov.uk with a generous timeout.
-  2. Validate it looks like a real CSV (size > 1 KB, has commas, not HTML).
-  3. Compute sha256 — used downstream to skip duplicate runs.
-  4. Save to a temp file. Caller owns lifecycle (deletion).
-  5. Retry on 5xx / network errors with exponential backoff.
+Two source modes:
 
-If all retries fail, raise DownloadError. The orchestrator catches it and
-sends a CRITICAL admin notification.
+  1. **API (default, production):** call gov.uk Fuel Finder API via
+     `etl.api_client` and parse the JSON response. This is what runs in
+     GitHub Actions every 6 hours.
+
+  2. **Local CSV (offline replay):** read a local CSV file (the legacy
+     gov.uk format). Used for `python -m etl.pipeline --local-csv`.
+
+Both modes return the same `FetchResult` — the rest of the pipeline doesn't
+need to know how the data arrived.
+
+A canonical sha256 is computed for deduplication. For API runs it digests
+the sorted list of (station_id + fuel_type + price + timestamp) tuples —
+this gives a stable identifier that ignores cosmetic differences (batch
+ordering, missing optional fields) but changes whenever real data changes.
 """
-import asyncio
 import hashlib
+import json
 import logging
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
-
 from etl import config
+from etl.api_client import (
+    fetch_all as api_fetch_all,
+    FuelFinderError,
+)
+from shared.csv_parser import (
+    parse_api_response,
+    parse_fuel_csv,
+    ParsedStation,
+)
 
 log = logging.getLogger(__name__)
 
 
 class DownloadError(Exception):
-    """Raised when download fails after all retries."""
+    """Raised when fetch fails. Caught by the pipeline orchestrator."""
 
 
 @dataclass
-class DownloadResult:
-    """Output of the download stage."""
-    path: Path          # temp file with the CSV
-    sha256: str         # 64-char hex digest
-    byte_size: int      # total bytes downloaded
+class FetchResult:
+    """Output of the fetch stage."""
+    stations: list[ParsedStation]   # already-parsed, ready for load_staging
+    sha256: str                     # canonical digest for dedup
+    source: str                     # 'api' or 'csv:path/to/file'
 
 
-async def download_csv(local_csv_path: str | Path | None = None) -> DownloadResult:
+# ──────────────────────────────────────────────────────────────────────
+# Public entry point
+# ──────────────────────────────────────────────────────────────────────
+
+async def fetch_data(local_csv_path: str | Path | None = None) -> FetchResult:
     """
-    Download the latest fuel-prices CSV with retries.
+    Fetch the latest fuel data — either from the API or a local CSV.
 
     Args:
-        local_csv_path: optional path to a local CSV. When provided, skip
-            the network and use this file as if it were just downloaded.
-            Useful for offline development, replaying historical CSVs from
-            the GitHub Releases archive, or testing against fixtures.
+        local_csv_path: optional path to a local CSV file. When provided,
+            the network is skipped.
 
     Returns:
-        DownloadResult with file path, sha256 digest, and byte size.
+        FetchResult with parsed stations + canonical sha256 + source tag.
 
     Raises:
-        DownloadError after exhausting all retries (network mode only).
+        DownloadError on any unrecoverable failure.
     """
     if local_csv_path is not None:
-        return _read_local(Path(local_csv_path))
-
-    last_error: Exception | None = None
-
-    for attempt in range(config.DOWNLOAD_MAX_RETRIES):
-        try:
-            return await _download_once()
-        except (httpx.HTTPError, ValueError) as exc:
-            last_error = exc
-            if attempt < config.DOWNLOAD_MAX_RETRIES - 1:
-                backoff = config.DOWNLOAD_RETRY_BACKOFF_SECONDS[attempt]
-                log.warning(
-                    "Download attempt %d/%d failed (%s). Retrying in %ds…",
-                    attempt + 1, config.DOWNLOAD_MAX_RETRIES, exc, backoff,
-                )
-                await asyncio.sleep(backoff)
-            else:
-                log.error("All %d download attempts failed.", config.DOWNLOAD_MAX_RETRIES)
-
-    raise DownloadError(f"Download failed after {config.DOWNLOAD_MAX_RETRIES} attempts: {last_error}")
+        return _fetch_from_csv(Path(local_csv_path))
+    return await _fetch_from_api()
 
 
-def _read_local(path: Path) -> DownloadResult:
-    """
-    Read a local CSV file and present it as a DownloadResult.
+# Backwards-compatible alias — old code calls `download_csv()`.
+# We keep the name so `etl.pipeline` doesn't need a coordinated rename.
+async def download_csv(local_csv_path: str | Path | None = None) -> FetchResult:
+    """Deprecated alias for fetch_data(). Will be removed in a future revision."""
+    return await fetch_data(local_csv_path=local_csv_path)
 
-    Computes sha256 the same way as the network path so deduplication still
-    works. The path returned is the original path — caller should NOT delete
-    it (it's not a temp file).
-    """
+
+# ──────────────────────────────────────────────────────────────────────
+# API path
+# ──────────────────────────────────────────────────────────────────────
+
+async def _fetch_from_api() -> FetchResult:
+    """Pull stations + prices from the gov.uk Fuel Finder API."""
+    if not config.FUEL_FINDER_CLIENT_ID or not config.FUEL_FINDER_CLIENT_SECRET:
+        raise DownloadError(
+            "API credentials not configured. Set FUEL_FINDER_CLIENT_ID and "
+            "FUEL_FINDER_CLIENT_SECRET (locally in .env, in production in "
+            "GitHub Secrets / Railway env vars)."
+        )
+
+    log.info("Fetching from Fuel Finder API…")
+    try:
+        stations_raw, prices_raw = await api_fetch_all(
+            client_id=config.FUEL_FINDER_CLIENT_ID,
+            client_secret=config.FUEL_FINDER_CLIENT_SECRET,
+        )
+    except FuelFinderError as exc:
+        raise DownloadError(f"API fetch failed: {exc}") from exc
+
+    if not stations_raw:
+        raise DownloadError("API returned 0 stations. Aborting (likely outage).")
+
+    stations = parse_api_response(stations_raw, prices_raw)
+    if not stations:
+        raise DownloadError(
+            "Parser returned 0 ParsedStation objects from non-empty API "
+            "response. Has the response schema changed?"
+        )
+
+    sha = _canonical_sha256(stations)
+
+    log.info(
+        "API fetch parsed: %d stations, %d total price records. sha256=%s…",
+        len(stations),
+        sum(len(s.prices) for s in stations),
+        sha[:12],
+    )
+    return FetchResult(stations=stations, sha256=sha, source="api")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# CSV path (offline replay)
+# ──────────────────────────────────────────────────────────────────────
+
+def _fetch_from_csv(path: Path) -> FetchResult:
+    """Read and parse a local CSV. Used by `--local-csv`."""
     if not path.exists():
         raise DownloadError(f"Local CSV not found: {path}")
 
+    log.info("Reading local CSV: %s", path)
+    stations = list(parse_fuel_csv(path))
+    if not stations:
+        raise DownloadError(f"CSV produced 0 stations: {path}")
+
+    # For CSV runs we keep the file-content sha as before — this preserves
+    # the existing dedup behaviour for CSV-replay scenarios.
     sha = hashlib.sha256()
-    byte_size = 0
     with path.open("rb") as f:
         while chunk := f.read(64 * 1024):
             sha.update(chunk)
-            byte_size += len(chunk)
+    digest = sha.hexdigest()
 
-    log.info("Using local CSV %s (%d bytes)", path, byte_size)
-
-    # Run the same validation as the network path
-    _validate_csv(path, byte_size)
-
-    return DownloadResult(
-        path=path,
-        sha256=sha.hexdigest(),
-        byte_size=byte_size,
+    log.info(
+        "CSV parsed: %d stations, %d total price records. sha256=%s…",
+        len(stations),
+        sum(len(s.prices) for s in stations),
+        digest[:12],
     )
+    return FetchResult(stations=stations, sha256=digest, source=f"csv:{path.name}")
 
 
-async def _download_once() -> DownloadResult:
+# ──────────────────────────────────────────────────────────────────────
+# Canonical hashing for dedup
+# ──────────────────────────────────────────────────────────────────────
+
+def _canonical_sha256(stations: list[ParsedStation]) -> str:
     """
-    Single download attempt. Raises HTTPError or ValueError on failure.
+    Compute a sha256 that's stable across batch orderings and immune to
+    cosmetic fields (price_last_updated, network timing, etc.).
 
-    We stream the body to disk in chunks. The CSV is 5-6 MB — fits in RAM —
-    but streaming keeps memory predictable and matches our 'bulk-friendly'
-    approach throughout ETL.
+    We digest the sorted list of (station_id, fuel_type, price, effective_ts)
+    tuples — these are the *substantive* fields that should change if and
+    only if the dataset has actually changed.
+
+    Why not hash the raw response: the API may return batches in different
+    orders, and `price_last_updated` ticks even when nothing else changes.
+    Hashing those would produce a different digest every run, defeating
+    dedup.
     """
-    log.info("Downloading CSV from %s", config.FUEL_PRICES_CSV_URL)
+    canonical = []
+    for s in sorted(stations, key=lambda x: x.station_id):
+        prices_sorted = sorted(s.prices, key=lambda p: p.fuel_type)
+        canonical.append({
+            "id": s.station_id,
+            "prices": [
+                {
+                    "fuel": p.fuel_type,
+                    "price": str(p.price_pence),
+                    "ts": p.forecourt_updated_at.isoformat()
+                          if p.forecourt_updated_at else None,
+                }
+                for p in prices_sorted
+            ],
+        })
 
-    # Save to a temp file. tempfile.NamedTemporaryFile with delete=False
-    # so the file survives this function — caller will clean up.
-    tmp = tempfile.NamedTemporaryFile(
-        prefix="fuel_csv_", suffix=".csv", delete=False,
-    )
-    tmp_path = Path(tmp.name)
-    tmp.close()
-
-    sha = hashlib.sha256()
-    byte_size = 0
-
-    # gov.uk blocks default httpx/requests User-Agents with 403 Forbidden.
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-    }
-    async with httpx.AsyncClient(timeout=config.DOWNLOAD_TIMEOUT_SECONDS, headers=headers) as client:
-        async with client.stream("GET", config.FUEL_PRICES_CSV_URL) as response:
-            response.raise_for_status() # raises on 4xx/5xx
- 
-            with tmp_path.open("wb") as f:
-                async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
-                    sha.update(chunk)
-                    f.write(chunk)
-                    byte_size += len(chunk)
-
-    # Sanity check the downloaded payload before declaring success.
-    _validate_csv(tmp_path, byte_size)
-
-    return DownloadResult(
-        path=tmp_path,
-        sha256=sha.hexdigest(),
-        byte_size=byte_size,
-    )
-
-
-def _validate_csv(path: Path, byte_size: int) -> None:
-    """
-    Quick checks that gov.uk gave us a real CSV, not a maintenance page.
-
-    Raises ValueError on failure — the caller treats this as a transient
-    error and retries. This is correct: gov.uk does occasionally return
-    HTML during maintenance.
-    """
-    if byte_size < config.DOWNLOAD_MIN_CSV_BYTES:
-        raise ValueError(
-            f"Downloaded file too small ({byte_size} bytes < "
-            f"{config.DOWNLOAD_MIN_CSV_BYTES}). Probably an error page."
-        )
-
-    # Read just the first 4 KB for content checks. We don't need the whole file.
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        head = f.read(4096)
-
-    head_lower = head.lower()
-    if "<html" in head_lower or "<!doctype html" in head_lower:
-        raise ValueError("Downloaded payload is HTML, not CSV (gov.uk maintenance page?).")
-
-    if "," not in head:
-        raise ValueError("Downloaded payload has no commas — doesn't look like a CSV.")
-
-    # Optional: verify the first column is what we expect. This catches
-    # silent format changes early, before the parser blows up.
-    if not head.startswith("forecourt_update_timestamp"):
-        # Don't raise — the parser will surface a clearer error if needed.
-        # Just warn so we have a paper trail.
-        log.warning(
-            "CSV first column is not 'forecourt_update_timestamp'. "
-            "Format may have changed. First 80 chars: %r",
-            head[:80],
-        )
+    payload = json.dumps(canonical, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
