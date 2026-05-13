@@ -5,10 +5,10 @@ on:
     # 4 cron-slots cover both BST (UTC+1, summer) and GMT (UTC+0, winter).
     # gov.uk publishes new CSVs ~2× per day; the redundant runs will hit
     # the dedup short-circuit (same sha256) and skip cheaply.
-    - cron: '15 9 * * *'    # 09:15 UTC = 10:15 BST / 09:15 GMT
-    - cron: '15 10 * * *'   # 10:15 UTC = 11:15 BST / 10:15 GMT
-    - cron: '15 15 * * *'   # 15:15 UTC = 16:15 BST / 15:15 GMT
-    - cron: '15 16 * * *'   # 16:15 UTC = 17:15 BST / 16:15 GMT
+    # - cron: '15 9 * * *'    # 09:15 UTC = 10:15 BST / 09:15 GMT
+    # - cron: '15 10 * * *'   # 10:15 UTC = 11:15 BST / 10:15 GMT
+    # - cron: '15 15 * * *'   # 15:15 UTC = 16:15 BST / 15:15 GMT
+    # - cron: '15 16 * * *'   # 16:15 UTC = 17:15 BST / 16:15 GMT
   # Manual trigger via the GitHub Actions UI
   workflow_dispatch: {}
 
